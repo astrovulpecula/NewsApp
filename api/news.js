@@ -1,9 +1,7 @@
-// api/news.js — con IMÁGENES (originales o generadas) + filtros
-// - 3 días, top 5 por relevancia
-// - Imagen preferente: a.urlToImage de NewsAPI
-// - Si falta imagen y habilitas IA: genera con OpenAI Images (gpt-image-1)
-// - Si no, usa un placeholder SVG
-// - Señaliza imágenes IA con imageIsAI: true
+// api/news.js — últimas 48h, top 5, filtro por tema, ES/EN con traducción, dedupe y soporte de imágenes
+// - Si una noticia es en inglés, el resumen se traduce al español y añade: "fuente original en inglés".
+// - Deduplica por URL y similitud de título.
+// - Preferimos imagen original (urlToImage). Si falta y ENABLE_AI_IMAGES=1, generamos con OpenAI Images.
 
 function normalizeTopic(s = '') {
   return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
@@ -53,7 +51,7 @@ function relevanceScore(cfg, a) {
     cfg.exclude.forEach((re) => { if (re.test(title) || re.test(desc)) score -= 5; });
   }
   const h = hoursAgo(a.publishedAt);
-  if (isFinite(h)) { const rec = Math.max(0, 72 - h) / 72; score += rec * 2; }
+  if (isFinite(h)) { const rec = Math.max(0, 48 - h) / 48; score += Math.max(0, rec) * 3; }
   return score;
 }
 
@@ -64,30 +62,54 @@ function placeholderSVG(title = '') {
 }
 
 async function generateImageFor(title, topicName) {
-  // Solo si activas ENABLE_AI_IMAGES=1 y tienes OPENAI_API_KEY
   if (process.env.ENABLE_AI_IMAGES !== '1' || !process.env.OPENAI_API_KEY) return { url: null, isAI: false };
   try {
     const prompt = `Ilustración editorial clara y minimalista relacionada con ${topicName}. Tema/noticia: ${title}. Sin texto, sin logos de marcas, formato panorámico.`;
     const r = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-image-1',
-        prompt,
-        size: '512x288',
-        // Puedes añadir style o quality si lo deseas
-      }),
+      method: 'POST', headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-1', prompt, size: '512x288' }),
     });
     if (!r.ok) return { url: null, isAI: false };
     const j = await r.json();
     const url = j.data?.[0]?.url || null;
     return { url, isAI: !!url };
-  } catch {
-    return { url: null, isAI: false };
-  }
+  } catch { return { url: null, isAI: false }; }
+}
+
+function normTitle(s='') {
+  return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim();
+}
+
+function titleSimilarity(a,b){
+  const A = new Set(normTitle(a).split(' '));
+  const B = new Set(normTitle(b).split(' '));
+  if (!A.size || !B.size) return 0;
+  let inter = 0; A.forEach(w=>{ if(B.has(w)) inter++; });
+  const jacc = inter / (A.size + B.size - inter);
+  return jacc; // 0..1
+}
+
+function isDuplicate(prev, cur){
+  if (prev.url && cur.url && prev.url.split('?')[0] === cur.url.split('?')[0]) return true;
+  const sim = titleSimilarity(prev.title||'', cur.title||'');
+  return sim >= 0.7;
+}
+
+async function fetchNewsFor(cfg, lang) {
+  const from = new Date(); from.setHours(from.getHours() - 48);
+  const params = new URLSearchParams({
+    q: cfg.q,
+    language: lang,
+    sortBy: 'publishedAt',
+    searchIn: 'title,description',
+    from: from.toISOString().slice(0,10),
+    pageSize: '50',
+  });
+  const url = `https://newsapi.org/v2/everything?${params}`;
+  const resp = await fetch(url, { headers: { 'X-Api-Key': process.env.NEWSAPI_KEY || '' } });
+  if (!resp.ok) throw new Error(await resp.text());
+  const data = await resp.json();
+  return (data.articles||[]).map(a => ({...a, _lang: lang}));
 }
 
 module.exports = async (req, res) => {
@@ -107,70 +129,65 @@ module.exports = async (req, res) => {
 
     const cfg = getTopicConfig(topicRaw);
 
-    // 2) NewsAPI (últimos 3 días, ES)
-    const from = new Date();
-    from.setDate(from.getDate() - 3);
-    const params = new URLSearchParams({
-      q: cfg.q,
-      language: 'es',
-      sortBy: 'publishedAt',
-      searchIn: 'title,description',
-      from: from.toISOString().slice(0,10),
-      pageSize: '50',
-    });
-    const newsURL = `https://newsapi.org/v2/everything?${params}`;
-
+    // 1) Traer ES + EN de las últimas 48 horas
     let raw = [];
     try {
-      const newsRes = await fetch(newsURL, { headers: { 'X-Api-Key': process.env.NEWSAPI_KEY || '' } });
-      if (!newsRes.ok) {
-        const txt = await newsRes.text();
-        return res.status(200).json({ articles: [], warning: `NewsAPI error: ${txt}` });
-      }
-      const news = await newsRes.json();
-      raw = (news.articles || []);
+      const [es, en] = await Promise.all([
+        fetchNewsFor(cfg, 'es'),
+        fetchNewsFor(cfg, 'en'),
+      ]);
+      raw = es.concat(en);
     } catch (err) {
-      return res.status(200).json({ articles: [], warning: `NewsAPI fetch failed: ${String(err)}` });
+      return res.status(200).json({ articles: [], warning: `NewsAPI error: ${String(err)}` });
     }
 
-    // 3) Filtrado + ranking + top 5
+    // 2) Filtrar por tema + dentro de 48h exactas
+    const within48h = (a) => hoursAgo(a.publishedAt) <= 48;
     const filteredBase = raw.filter((a) => {
+      if (!within48h(a)) return false;
       const text = `${a.title || ''} ${a.description || ''}`;
       const okInclude = cfg.include ? cfg.include.some((re) => re.test(text)) : true;
       const okExclude = cfg.exclude ? !cfg.exclude.some((re) => re.test(text)) : true;
       return okInclude && okExclude;
     });
 
-    const ranked = filteredBase
-      .map((a) => ({ a, score: relevanceScore(cfg, a) }))
-      .sort((x, y) => y.score - x.score)
-      .slice(0, 5)
-      .map((x) => x.a);
+    // 3) Ranking y DEDUP (mantener la mejor)
+    const scored = filteredBase.map(a => ({ a, score: relevanceScore(cfg, a) }));
+    const deduped = [];
+    for (const cur of scored.sort((x,y)=> y.score - x.score)) {
+      const keep = !deduped.some(prev => isDuplicate(prev.a, cur.a));
+      if (keep) deduped.push(cur);
+    }
 
-    // 4) Resumen + imagen para cada artículo
+    const top5 = deduped.slice(0,5).map(x => x.a);
+
+    // 4) Resumen + imagen (traducción si EN)
     async function summarize(a) {
-      const prompt = `Resume en 3-4 frases, en español y de forma neutral, la noticia basada en el título y la descripción. No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`;
-      if (!process.env.OPENAI_API_KEY) return a.description || a.content || '';
+      const en = a._lang === 'en';
+      const basePrompt = en
+        ? `Resume en español en 3-4 frases y traduce de forma natural; al final añade exactamente: "fuente original en inglés". No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`
+        : `Resume en 3-4 frases, en español y de forma neutral. No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`;
+      if (!process.env.OPENAI_API_KEY) {
+        const desc = a.description || a.content || '';
+        return en ? (desc ? `${desc}\n\nfuente original en inglés` : 'fuente original en inglés') : desc;
+      }
       try {
         const r = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'gpt-4o-mini',
-            messages: [
-              { role: 'system', content: 'Eres un asistente que resume noticias con precisión y neutralidad.' },
-              { role: 'user', content: prompt },
-            ],
-            temperature: 0.2,
-          }),
+          headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Eres un asistente que resume noticias con precisión y neutralidad.' }, { role: 'user', content: basePrompt } ], temperature: 0.2 })
         });
-        if (!r.ok) return a.description || a.content || '';
+        if (!r.ok) {
+          const desc = a.description || a.content || '';
+          return en ? (desc ? `${desc}\n\nfuente original en inglés` : 'fuente original en inglés') : desc;
+        }
         const j = await r.json();
-        return j.choices?.[0]?.message?.content?.trim?.() || a.description || '';
-      } catch { return a.description || a.content || ''; }
+        const txt = j.choices?.[0]?.message?.content?.trim?.() || (a.description || '');
+        return txt;
+      } catch {
+        const desc = a.description || a.content || '';
+        return en ? (desc ? `${desc}\n\nfuente original en inglés` : 'fuente original en inglés') : desc;
+      }
     }
 
     async function pickImage(a) {
@@ -181,7 +198,7 @@ module.exports = async (req, res) => {
     }
 
     const articles = await Promise.all(
-      ranked.map(async (a, idx) => {
+      top5.map(async (a, idx) => {
         const summary = await summarize(a);
         const img = await pickImage(a);
         return {
