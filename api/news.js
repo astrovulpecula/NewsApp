@@ -1,7 +1,8 @@
-// api/news.js — últimas 48h, top 5, filtro por tema, ES/EN con traducción, dedupe y soporte de imágenes
-// - Si una noticia es en inglés, el resumen se traduce al español y añade: "fuente original en inglés".
-// - Deduplica por URL y similitud de título.
-// - Preferimos imagen original (urlToImage). Si falta y ENABLE_AI_IMAGES=1, generamos con OpenAI Images.
+// api/news.js — FINAL
+// Ventana: 48h · Top 5 con cupos: 3 ES + 2 EN (rellena si falta) · Dedupe por URL/título
+// Titulares: si la noticia es EN, se traduce SIEMPRE el titular al español
+// Resúmenes: 5–10 líneas (una frase por línea); si EN, añade "fuente original en inglés"
+// Imágenes: usa urlToImage; si falta y ENABLE_AI_IMAGES=1, genera con OpenAI; si no, placeholder
 
 function normalizeTopic(s = '') {
   return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
@@ -10,7 +11,7 @@ function normalizeTopic(s = '') {
 function getTopicConfig(topicRaw) {
   const t = normalizeTopic(topicRaw);
   const TECNO = {
-    q: '"tecnologia" OR tecnologia OR smartphone OR "telefono inteligente" OR Android OR iPhone OR Apple OR Google OR Microsoft OR software OR hardware OR gadget OR chip OR semiconductor OR ciberseguridad OR internet',
+    q: '\"tecnologia\" OR tecnologia OR smartphone OR \"telefono inteligente\" OR Android OR iPhone OR Apple OR Google OR Microsoft OR software OR hardware OR gadget OR chip OR semiconductor OR ciberseguridad OR internet',
     include: [
       /tecnolog/i, /smartphone/i, /m[óo]vil|telefono inteligente/i,
       /android/i, /iphone|ios|apple/i, /microsoft|windows/i, /google|pixel/i,
@@ -19,11 +20,11 @@ function getTopicConfig(topicRaw) {
     exclude: [/f[úu]tbol|tenis|baloncesto|moda|celebridad|cocina|viajes/i],
   };
   const ASTRO = {
-    q: 'astrofotografia OR astrophotography OR "fotografia astronomica" OR telescopio OR "via lactea" OR "cielo profundo" OR nebulosa OR cometa',
+    q: 'astrofotografia OR astrophotography OR \"fotografia astronomica\" OR telescopio OR \"via lactea\" OR \"cielo profundo\" OR nebulosa OR cometa',
     include: [/astrofotograf|astrophotograph|fotografia astronom|via lactea|nebulosa|cometa|telescopi|cielo profundo/i],
   };
   const AI = {
-    q: '"inteligencia artificial" OR IA OR "machine learning" OR "aprendizaje automatico" OR "deep learning" OR OpenAI OR ChatGPT OR LLM OR "modelo generativo" OR transformer',
+    q: '\"inteligencia artificial\" OR IA OR \"machine learning\" OR \"aprendizaje automatico\" OR \"deep learning\" OR OpenAI OR ChatGPT OR LLM OR \"modelo generativo\" OR transformer',
     include: [/inteligencia artificial|\bIA\b|machine learning|aprendizaje automatico|deep learning|openai|chatgpt|modelo generativo|\bLLM\b|transformer/i],
   };
   if (/astro/.test(t)) return { name: 'Astrofotografía', ...ASTRO };
@@ -112,6 +113,35 @@ async function fetchNewsFor(cfg, lang) {
   return (data.articles||[]).map(a => ({...a, _lang: lang}));
 }
 
+function formatToLines(text, min=5, max=10) {
+  if (!text) return '';
+  const parts = (text.replace(/\n+/g,' ').split(/(?<=[\.!?])\s+/).filter(Boolean));
+  const sliced = parts.slice(0, Math.max(min, Math.min(max, parts.length)));
+  return sliced.join('\n');
+}
+
+async function translateTitleToEs(a) {
+  if (a._lang !== 'en') return a.title || '';
+  if (!process.env.OPENAI_API_KEY) return a.title || '';
+  try {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Traduce títulos del inglés al español de forma natural. Devuelve SOLO el título, sin comillas ni explicaciones.' },
+          { role: 'user', content: `Traduce al español este titular:\n${a.title || ''}` }
+        ],
+        temperature: 0.1,
+      })
+    });
+    if (!r.ok) return a.title || '';
+    const j = await r.json();
+    return j.choices?.[0]?.message?.content?.trim?.() || (a.title || '');
+  } catch { return a.title || ''; }
+}
+
 module.exports = async (req, res) => {
   try {
     const topicRaw = (req.query?.topic || 'tecnología').toString();
@@ -160,7 +190,7 @@ module.exports = async (req, res) => {
       return okInclude && okExclude;
     });
 
-    // 3) Ranking por relevancia/recencia y selección con cupos (máx 3 ES + 2 EN, total 5)
+    // 3) Ranking con cupos: máx 3 ES + 2 EN (rellena hasta 5)
     const scoredEs = filteredEs.map(a => ({ a, score: relevanceScore(cfg, a) })).sort((x,y)=> y.score - x.score);
     const scoredEn = filteredEn.map(a => ({ a, score: relevanceScore(cfg, a) })).sort((x,y)=> y.score - x.score);
 
@@ -178,13 +208,10 @@ module.exports = async (req, res) => {
       return out;
     }
 
-    // Paso A: intentar cubrir cupos ideales 3 ES + 2 EN
-    const cupoEs = 3;
-    const cupoEn = 2;
-    const pickedEs = takeFrom(scoredEs, cupoEs);
-    const pickedEn = takeFrom(scoredEn, cupoEn);
+    const cupoEs = 3; const cupoEn = 2;
+    takeFrom(scoredEs, cupoEs);
+    takeFrom(scoredEn, cupoEn);
 
-    // Paso B: si faltan hasta 5, rellenar con lo mejor disponible de ambos
     let combinedRemainder = [
       ...scoredEs.filter(x => !chosen.includes(x.a)),
       ...scoredEn.filter(x => !chosen.includes(x.a))
@@ -198,34 +225,38 @@ module.exports = async (req, res) => {
 
     const top5 = chosen.slice(0,5);
 
-    // 4) Resumen + imagen (traducción si EN)
     async function summarize(a) {
       const en = a._lang === 'en';
       const basePrompt = en
-        ? `Resume en español en 3-4 frases y traduce de forma natural; al final añade exactamente: "fuente original en inglés". No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`
-        : `Resume en 3-4 frases, en español y de forma neutral. No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`;
+        ? `Traduce y resume al ESPAÑOL en 5 a 10 líneas. Cada línea debe ser una frase corta separada por salto de línea. Al final añade exactamente: "fuente original en inglés". No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`
+        : `Resume en ESPAÑOL en 5 a 10 líneas. Cada línea debe ser una frase corta separada por salto de línea. No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`;
       if (!process.env.OPENAI_API_KEY) {
         const desc = a.description || a.content || '';
-        return en ? (desc ? `${desc}\n\nfuente original en inglés` : 'fuente original en inglés') : desc;
+        const base = formatToLines(desc || '', 5, 10);
+        return en ? (base ? `${base}\n\nfuente original en inglés` : 'fuente original en inglés') : base;
       }
       try {
         const r = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Eres un asistente que resume noticias con precisión y neutralidad.' }, { role: 'user', content: basePrompt } ], temperature: 0.2 })
+          body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Eres un asistente que traduce y resume noticias al español con precisión y neutralidad. Usa 5–10 líneas, cada una una frase.' }, { role: 'user', content: basePrompt } ], temperature: 0.2 })
         });
         if (!r.ok) {
           const desc = a.description || a.content || '';
-          return en ? (desc ? `${desc}\n\nfuente original en inglés` : 'fuente original en inglés') : desc;
+          const base = formatToLines(desc || '', 5, 10);
+          return en ? (base ? `${base}\n\nfuente original en inglés` : 'fuente original en inglés') : base;
         }
         const j = await r.json();
-        const txt = j.choices?.[0]?.message?.content?.trim?.() || (a.description || '');
-        return txt;
+        const txt = j.choices?.[0]?.message?.content?.trim?.() || '';
+        return txt || formatToLines(a.description || '', 5, 10);
       } catch {
         const desc = a.description || a.content || '';
-        return en ? (desc ? `${desc}\n\nfuente original en inglés` : 'fuente original en inglés') : desc;
+        const base = formatToLines(desc || '', 5, 10);
+        return en ? (base ? `${base}\n\nfuente original en inglés` : 'fuente original en inglés') : base;
       }
     }
+
+    async function translateTitle(a) { return translateTitleToEs(a); }
 
     async function pickImage(a) {
       if (a.urlToImage) return { url: a.urlToImage, isAI: false };
@@ -236,11 +267,14 @@ module.exports = async (req, res) => {
 
     const articles = await Promise.all(
       top5.map(async (a, idx) => {
-        const summary = await summarize(a);
-        const img = await pickImage(a);
+        const [titleEs, summary, img] = await Promise.all([
+          translateTitle(a),
+          summarize(a),
+          pickImage(a),
+        ]);
         return {
           id: `${a.source?.id ?? 'news'}-${idx}`,
-          title: a.title,
+          title: titleEs || a.title,
           publishedAt: a.publishedAt,
           sourceName: a.source?.name ?? 'Desconocida',
           url: a.url,
