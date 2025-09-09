@@ -18,9 +18,11 @@
     h1,h2,h3 { margin: 0 0 10px; }
     ul { list-style:none; padding:0; margin:0; }
     li + li { margin-top: 8px; }
-    .headline { padding:12px; border-radius:12px; border:1px solid #eee; cursor:pointer; }
+    .headline { padding:12px; border-radius:12px; border:1px solid #eee; cursor:pointer; overflow:hidden; }
     .headline:hover { background:#fafafa; }
     .badge { font-size:12px; padding:4px 8px; border-radius:999px; border:1px solid #ddd; }
+    .thumb { width:100%; height:160px; object-fit:cover; border-radius:12px; margin-bottom:8px; display:block; }
+    .ai-tag { font-size:10px; padding:2px 6px; border-radius:999px; border:1px solid #ddd; color:#6b7280; }
   </style>
 </head>
 <body>
@@ -84,6 +86,7 @@
       <div class="card">
         <h2 id="detail-title"></h2>
         <div class="muted" id="detail-meta" style="margin-bottom:12px"></div>
+        <img id="detail-img" class="thumb" style="height:auto;max-height:360px;" alt="" />
         <div id="detail-content" style="line-height:1.6"></div>
         <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center;">
           <a id="detail-link" href="#" target="_blank">Ver fuente original</a>
@@ -94,58 +97,26 @@
   </div>
 
   <script>
-    // Ajusta esto SOLO si sirves el HTML en un dominio y el backend en otro.
-    // Si TODO está en Vercel (recomendado), deja cadena vacía:
-    const BACKEND_URL = ""; // ej. "https://tu-proyecto.vercel.app" si usas GitHub Pages para el HTML
-
-    const state = { topic: "", items: [], active: null, backendOK: false };
+    const BACKEND_URL = ""; // Si front y backend están en Vercel, déjalo vacío
+    const state = { topic: "", items: [], active: null };
     const el = (id) => document.getElementById(id);
     const trimSlash = (s) => s.replace(/\/$/, "");
     const apiUrl = (topic) => `${BACKEND_URL ? trimSlash(BACKEND_URL) : ""}/api/news?topic=${encodeURIComponent(topic)}`;
 
-    function show(view) {
-      ["home", "list", "detail"].forEach(v => {
-        el(`view-${v}`).classList.toggle("hidden", v !== view);
-      });
-    }
+    function show(view) { ["home","list","detail"].forEach(v => el(`view-${v}`).classList.toggle("hidden", v!==view)); }
 
-    function setConnBadge(ok) {
-      const b = el("connBadge");
-      if (ok) { b.textContent = "Conectado a backend"; b.style.borderColor = "#16a34a"; b.style.color = "#16a34a"; }
-      else { b.textContent = "Modo demo"; b.style.borderColor = "#a3a3a3"; b.style.color = "#737373"; }
-    }
+    function setConnBadge(ok) { const b = el("connBadge"); if (ok) { b.textContent = "Conectado a backend"; b.style.borderColor = "#16a34a"; b.style.color = "#16a34a"; } else { b.textContent = "Modo demo"; b.style.borderColor = "#a3a3a3"; b.style.color = "#737373"; } }
 
-    async function pingBackend() {
-      try {
-        const res = await fetch(apiUrl("ping"));
-        state.backendOK = res.ok; setConnBadge(true);
-      } catch { state.backendOK = false; setConnBadge(false); }
-    }
+    async function pingBackend() { try { const res = await fetch(apiUrl("ping")); setConnBadge(res.ok); } catch { setConnBadge(false); } }
 
-    function goHome() {
-      state.topic = ""; state.items = []; state.active = null;
-      show("home");
-    }
-
-    function pickTopic(t) {
-      state.topic = t || "Tema";
-      el("list-title").textContent = state.topic;
-      show("list");
-      loadNews();
-    }
-
-    function confirmCustomTopic() {
-      const t = (el("customTopic").value || "Tema personalizado").trim();
-      pickTopic(t);
-    }
+    function goHome() { state.topic = ""; state.items = []; state.active = null; show("home"); }
+    function pickTopic(t) { state.topic = t || "Tema"; el("list-title").textContent = state.topic; show("list"); loadNews(); }
+    function confirmCustomTopic() { const t = (el("customTopic").value || "Tema personalizado").trim(); pickTopic(t); }
 
     async function loadNews() {
-      const list = el("headlines");
-      list.innerHTML = `<div class="card">Cargando titulares…</div>`;
-
+      const list = el("headlines"); list.innerHTML = `<div class="card">Cargando titulares…</div>`;
       try {
-        const res = await fetch(apiUrl(state.topic));
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const res = await fetch(apiUrl(state.topic)); if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         state.items = (data.articles || []).map((a, idx) => ({
           id: a.id || `${state.topic}-${idx}`,
@@ -154,30 +125,26 @@
           sourceName: a.sourceName || (a.source?.name || ""),
           url: a.url,
           content: a.summary || a.content || a.description || "",
+          imageUrl: a.imageUrl || "",
+          imageAI: !!a.imageIsAI,
         }));
         setConnBadge(true);
       } catch (e) {
-        // Fallback demo si no hay backend
-        const today = new Date();
-        const fmt = (d) => d.toISOString().slice(0,10);
-        state.items = Array.from({length:6}).map((_,i)=>{
-          const d = new Date(today); d.setDate(d.getDate()-i);
-          return { id:`${state.topic}-${i}`, title:`${state.topic}: titular de ejemplo ${i+1}`, date:fmt(d), sourceName:"Demo", url:"#", content:`Cuerpo de ejemplo ${i+1}. Sustituye con el backend.` };
-        });
+        const today = new Date(); const fmt = (d) => d.toISOString().slice(0,10);
+        state.items = Array.from({length:5}).map((_,i)=>{ const d=new Date(today); d.setDate(d.getDate()-i); return { id:`${state.topic}-${i}`, title:`${state.topic}: titular de ejemplo ${i+1}`, date:fmt(d), sourceName:"Demo", url:"#", content:`Cuerpo de ejemplo ${i+1}. Sustituye con el backend.`, imageUrl:"", imageAI:false };});
         setConnBadge(false);
       }
-
       renderList();
     }
 
     function renderList() {
-      const list = el("headlines");
-      if (!state.items.length) { list.innerHTML = `<div class="card muted">Sin titulares.</div>`; return; }
+      const list = el("headlines"); if (!state.items.length) { list.innerHTML = `<div class="card muted">Sin titulares.</div>`; return; }
       list.innerHTML = "";
       state.items.forEach(item => {
-        const li = document.createElement("div");
-        li.className = "headline";
-        li.innerHTML = `<div><strong>${item.title}</strong></div><div class=\"muted\" style=\"font-size:12px\">Fecha: ${item.date || ""} · Origen: ${item.sourceName || ""}</div>`;
+        const li = document.createElement("div"); li.className = "headline";
+        const img = item.imageUrl ? `<img src="${item.imageUrl}" alt="" class="thumb">` : "";
+        const ai = item.imageAI ? `<span class="ai-tag">IA</span>` : "";
+        li.innerHTML = `${img}<div><strong>${item.title}</strong></div><div class=\"muted\" style=\"font-size:12px\">Fecha: ${item.date || ""} · Origen: ${item.sourceName || ""} ${ai}</div>`;
         li.onclick = () => openItem(item);
         list.appendChild(li);
       });
@@ -187,6 +154,7 @@
       state.active = item;
       el("detail-title").textContent = item.title;
       el("detail-meta").textContent = `Fecha: ${item.date || ""} · Origen: ${item.sourceName || ""}`;
+      const di = el("detail-img"); if (item.imageUrl) { di.src = item.imageUrl; di.style.display = 'block'; } else { di.removeAttribute('src'); di.style.display = 'none'; }
       el("detail-content").textContent = item.content || "";
       el("detail-link").href = item.url || "#";
       show("detail");
@@ -195,7 +163,6 @@
     function backToList() { show("list"); }
     function refresh() { loadNews(); }
 
-    // Arranque
     pingBackend();
   </script>
 </body>

@@ -1,20 +1,16 @@
-// api/news.js — FILTRO POR CATEGORÍA (Tecnología / Astrofotografía / IA)
-// Copia y pega TODO este archivo en /api/news.js de tu repositorio.
-// Objetivo: que si eliges "Tecnología" salgan solo noticias de tecnología;
-// lo mismo para "Astrofotografía" e "Inteligencia Artificial".
+// api/news.js — con IMÁGENES (originales o generadas) + filtros
+// - 3 días, top 5 por relevancia
+// - Imagen preferente: a.urlToImage de NewsAPI
+// - Si falta imagen y habilitas IA: genera con OpenAI Images (gpt-image-1)
+// - Si no, usa un placeholder SVG
+// - Señaliza imágenes IA con imageIsAI: true
 
-// Utilidades para mapear el tema que viene del front a una consulta y a filtros
 function normalizeTopic(s = '') {
-  return s
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quita acentos
-    .toLowerCase()
-    .trim();
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
 }
 
 function getTopicConfig(topicRaw) {
   const t = normalizeTopic(topicRaw);
-
-  // Palabras clave y filtros por tema
   const TECNO = {
     q: '"tecnologia" OR tecnologia OR smartphone OR "telefono inteligente" OR Android OR iPhone OR Apple OR Google OR Microsoft OR software OR hardware OR gadget OR chip OR semiconductor OR ciberseguridad OR internet',
     include: [
@@ -24,43 +20,94 @@ function getTopicConfig(topicRaw) {
     ],
     exclude: [/f[úu]tbol|tenis|baloncesto|moda|celebridad|cocina|viajes/i],
   };
-
   const ASTRO = {
     q: 'astrofotografia OR astrophotography OR "fotografia astronomica" OR telescopio OR "via lactea" OR "cielo profundo" OR nebulosa OR cometa',
     include: [/astrofotograf|astrophotograph|fotografia astronom|via lactea|nebulosa|cometa|telescopi|cielo profundo/i],
   };
-
   const AI = {
     q: '"inteligencia artificial" OR IA OR "machine learning" OR "aprendizaje automatico" OR "deep learning" OR OpenAI OR ChatGPT OR LLM OR "modelo generativo" OR transformer',
     include: [/inteligencia artificial|\bIA\b|machine learning|aprendizaje automatico|deep learning|openai|chatgpt|modelo generativo|\bLLM\b|transformer/i],
   };
-
   if (/astro/.test(t)) return { name: 'Astrofotografía', ...ASTRO };
   if (/(^|\s)ai(\s|$)/.test(t) || /inteligencia artificial|aprendizaje|machine/.test(t)) return { name: 'Inteligencia Artificial', ...AI };
   if (/tecno/.test(t)) return { name: 'Tecnología', ...TECNO };
-  // Tema libre (Otros temas)
   return { name: topicRaw, q: topicRaw, include: [new RegExp(topicRaw, 'i')] };
+}
+
+function hoursAgo(iso) {
+  const t = new Date(iso).getTime();
+  if (!t) return 9999;
+  return (Date.now() - t) / (1000 * 60 * 60);
+}
+
+function relevanceScore(cfg, a) {
+  const title = (a.title || "");
+  const desc = (a.description || "");
+  let score = 0;
+  if (cfg.include) {
+    cfg.include.forEach((re) => {
+      if (re.test(title)) score += 3; else if (re.test(desc)) score += 1.5;
+    });
+  }
+  if (cfg.exclude) {
+    cfg.exclude.forEach((re) => { if (re.test(title) || re.test(desc)) score -= 5; });
+  }
+  const h = hoursAgo(a.publishedAt);
+  if (isFinite(h)) { const rec = Math.max(0, 72 - h) / 72; score += rec * 2; }
+  return score;
+}
+
+function placeholderSVG(title = '') {
+  const t = (title || 'Noticia').replace(/</g,'&lt;').slice(0,60);
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='576'>\n  <defs>\n    <linearGradient id='g' x1='0' x2='1' y1='0' y2='1'>\n      <stop stop-color='#eef2ff' offset='0'/>\n      <stop stop-color='#e2e8f0' offset='1'/>\n    </linearGradient>\n  </defs>\n  <rect fill='url(#g)' width='100%' height='100%'/>\n  <text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle'\n        font-family='system-ui,Arial' font-size='36' fill='#334155'>${t}</text>\n</svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+}
+
+async function generateImageFor(title, topicName) {
+  // Solo si activas ENABLE_AI_IMAGES=1 y tienes OPENAI_API_KEY
+  if (process.env.ENABLE_AI_IMAGES !== '1' || !process.env.OPENAI_API_KEY) return { url: null, isAI: false };
+  try {
+    const prompt = `Ilustración editorial clara y minimalista relacionada con ${topicName}. Tema/noticia: ${title}. Sin texto, sin logos de marcas, formato panorámico.`;
+    const r = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-image-1',
+        prompt,
+        size: '512x288',
+        // Puedes añadir style o quality si lo deseas
+      }),
+    });
+    if (!r.ok) return { url: null, isAI: false };
+    const j = await r.json();
+    const url = j.data?.[0]?.url || null;
+    return { url, isAI: !!url };
+  } catch {
+    return { url: null, isAI: false };
+  }
 }
 
 module.exports = async (req, res) => {
   try {
     const topicRaw = (req.query?.topic || 'tecnología').toString();
 
-    // 0) Rutas utilitarias de salud/diag
     if (topicRaw === 'ping') return res.status(200).json({ ok: true, articles: [] });
     if (topicRaw === '__diag') {
       return res.status(200).json({
         ok: true,
         hasOpenAI: Boolean(process.env.OPENAI_API_KEY),
         hasNewsAPI: Boolean(process.env.NEWSAPI_KEY),
+        aiImages: process.env.ENABLE_AI_IMAGES === '1',
         env: process.env.VERCEL_ENV || 'unknown'
       });
     }
 
-    // 1) Construir consulta según tema
     const cfg = getTopicConfig(topicRaw);
 
-    // 2) Llamar a NewsAPI (últimos 3 días, español, buscando sobre todo en títulos y descripción)
+    // 2) NewsAPI (últimos 3 días, ES)
     const from = new Date();
     from.setDate(from.getDate() - 3);
     const params = new URLSearchParams({
@@ -69,7 +116,7 @@ module.exports = async (req, res) => {
       sortBy: 'publishedAt',
       searchIn: 'title,description',
       from: from.toISOString().slice(0,10),
-      pageSize: '50', // traer más y luego filtrar
+      pageSize: '50',
     });
     const newsURL = `https://newsapi.org/v2/everything?${params}`;
 
@@ -86,38 +133,7 @@ module.exports = async (req, res) => {
       return res.status(200).json({ articles: [], warning: `NewsAPI fetch failed: ${String(err)}` });
     }
 
-    // 3) Filtro extra en servidor (por si NewsAPI mete ruido) + ranking por relevancia y recencia (72h)
-    function hoursAgo(iso) {
-      const t = new Date(iso).getTime();
-      if (!t) return 9999;
-      return (Date.now() - t) / (1000 * 60 * 60);
-    }
-
-    function relevanceScore(cfg, a) {
-      const title = (a.title || "");
-      const desc = (a.description || "");
-      let score = 0;
-      // Coincidencias en título pesan más que en descripción
-      if (cfg.include) {
-        cfg.include.forEach((re) => {
-          if (re.test(title)) score += 3;
-          else if (re.test(desc)) score += 1.5;
-        });
-      }
-      if (cfg.exclude) {
-        cfg.exclude.forEach((re) => {
-          if (re.test(title) || re.test(desc)) score -= 5;
-        });
-      }
-      // Recencia: dentro de 72h obtiene bonificación (0..2)
-      const h = hoursAgo(a.publishedAt);
-      if (isFinite(h)) {
-        const rec = Math.max(0, 72 - h) / 72; // 0..1
-        score += rec * 2;
-      }
-      return score;
-    }
-
+    // 3) Filtrado + ranking + top 5
     const filteredBase = raw.filter((a) => {
       const text = `${a.title || ''} ${a.description || ''}`;
       const okInclude = cfg.include ? cfg.include.some((re) => re.test(text)) : true;
@@ -125,14 +141,13 @@ module.exports = async (req, res) => {
       return okInclude && okExclude;
     });
 
-    // Ordenar por score descendente y quedarnos con TOP 5
-    const filtered = filteredBase
+    const ranked = filteredBase
       .map((a) => ({ a, score: relevanceScore(cfg, a) }))
       .sort((x, y) => y.score - x.score)
       .slice(0, 5)
       .map((x) => x.a);
 
-    // 4) Resumen con OpenAI si hay clave; si no, usar descripción
+    // 4) Resumen + imagen para cada artículo
     async function summarize(a) {
       const prompt = `Resume en 3-4 frases, en español y de forma neutral, la noticia basada en el título y la descripción. No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`;
       if (!process.env.OPENAI_API_KEY) return a.description || a.content || '';
@@ -158,15 +173,28 @@ module.exports = async (req, res) => {
       } catch { return a.description || a.content || ''; }
     }
 
+    async function pickImage(a) {
+      if (a.urlToImage) return { url: a.urlToImage, isAI: false };
+      const gen = await generateImageFor(a.title, cfg.name);
+      if (gen.url) return gen;
+      return { url: placeholderSVG(a.title), isAI: false };
+    }
+
     const articles = await Promise.all(
-      filtered.map(async (a, idx) => ({
-        id: `${a.source?.id ?? 'news'}-${idx}`,
-        title: a.title,
-        publishedAt: a.publishedAt,
-        sourceName: a.source?.name ?? 'Desconocida',
-        url: a.url,
-        summary: await summarize(a),
-      }))
+      ranked.map(async (a, idx) => {
+        const summary = await summarize(a);
+        const img = await pickImage(a);
+        return {
+          id: `${a.source?.id ?? 'news'}-${idx}`,
+          title: a.title,
+          publishedAt: a.publishedAt,
+          sourceName: a.source?.name ?? 'Desconocida',
+          url: a.url,
+          summary,
+          imageUrl: img.url,
+          imageIsAI: img.isAI,
+        };
+      })
     );
 
     return res.status(200).json({ articles });
