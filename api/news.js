@@ -141,9 +141,10 @@ module.exports = async (req, res) => {
       return res.status(200).json({ articles: [], warning: `NewsAPI error: ${String(err)}` });
     }
 
-    // 2) Filtrar por tema + dentro de 48h exactas
+    // 2) Filtrar por tema + dentro de 48h exactas (SEPARADO ES/EN)
     const within48h = (a) => hoursAgo(a.publishedAt) <= 48;
-    const filteredBase = raw.filter((a) => {
+
+    const filteredEs = raw.filter((a) => a._lang === 'es').filter((a) => {
       if (!within48h(a)) return false;
       const text = `${a.title || ''} ${a.description || ''}`;
       const okInclude = cfg.include ? cfg.include.some((re) => re.test(text)) : true;
@@ -151,15 +152,51 @@ module.exports = async (req, res) => {
       return okInclude && okExclude;
     });
 
-    // 3) Ranking y DEDUP (mantener la mejor)
-    const scored = filteredBase.map(a => ({ a, score: relevanceScore(cfg, a) }));
-    const deduped = [];
-    for (const cur of scored.sort((x,y)=> y.score - x.score)) {
-      const keep = !deduped.some(prev => isDuplicate(prev.a, cur.a));
-      if (keep) deduped.push(cur);
+    const filteredEn = raw.filter((a) => a._lang === 'en').filter((a) => {
+      if (!within48h(a)) return false;
+      const text = `${a.title || ''} ${a.description || ''}`;
+      const okInclude = cfg.include ? cfg.include.some((re) => re.test(text)) : true;
+      const okExclude = cfg.exclude ? !cfg.exclude.some((re) => re.test(text)) : true;
+      return okInclude && okExclude;
+    });
+
+    // 3) Ranking por relevancia/recencia y selección con cupos (máx 3 ES + 2 EN, total 5)
+    const scoredEs = filteredEs.map(a => ({ a, score: relevanceScore(cfg, a) })).sort((x,y)=> y.score - x.score);
+    const scoredEn = filteredEn.map(a => ({ a, score: relevanceScore(cfg, a) })).sort((x,y)=> y.score - x.score);
+
+    const chosen = [];
+    const isDupVsChosen = (cand) => chosen.some(prev => isDuplicate(prev, cand));
+
+    function takeFrom(list, maxCount) {
+      const out = [];
+      for (const it of list) {
+        if (out.length >= maxCount) break;
+        if (isDupVsChosen(it.a)) continue;
+        out.push(it.a);
+        chosen.push(it.a);
+      }
+      return out;
     }
 
-    const top5 = deduped.slice(0,5).map(x => x.a);
+    // Paso A: intentar cubrir cupos ideales 3 ES + 2 EN
+    const cupoEs = 3;
+    const cupoEn = 2;
+    const pickedEs = takeFrom(scoredEs, cupoEs);
+    const pickedEn = takeFrom(scoredEn, cupoEn);
+
+    // Paso B: si faltan hasta 5, rellenar con lo mejor disponible de ambos
+    let combinedRemainder = [
+      ...scoredEs.filter(x => !chosen.includes(x.a)),
+      ...scoredEn.filter(x => !chosen.includes(x.a))
+    ].sort((x,y)=> y.score - x.score);
+
+    while (chosen.length < 5 && combinedRemainder.length) {
+      const next = combinedRemainder.shift();
+      if (isDupVsChosen(next.a)) continue;
+      chosen.push(next.a);
+    }
+
+    const top5 = chosen.slice(0,5);
 
     // 4) Resumen + imagen (traducción si EN)
     async function summarize(a) {
