@@ -1,0 +1,348 @@
+import React, { useMemo, useState, useEffect } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Separator } from "@/components/ui/separator";
+
+// \n// Web App de Noticias (HTML5)\n// ------------------------------------------------------------\n// Flujo solicitado por el usuario (en español):\n// 1) Pantalla inicial con 3 botones: Astrofotografia, Tecnología y AI + botón "Otros temas".\n// 2) Al elegir un tema, Pantalla 2 con titulares (y fecha) "aportados por ChatGPT".\n//    Abajo, botón para volver a la primera pantalla.\n// 3) Al pulsar un titular, Pantalla 3 con el texto de la noticia y, abajo, el link de la fuente.\n// ------------------------------------------------------------\n// Nota técnica: Esta demo usa un proveedor de datos simulado (FakeNewsProvider).\n// Para conectarlo a tu backend (p.ej. ChatGPT + web.run / News API), sustituye\n// la función fetchNewsByTopic por una llamada real y mantén la misma forma de datos.\n
+const CATEGORIES = [
+  { id: "astrofotografia", label: "Astrofotografia", query: "Astrofotografia" },
+  { id: "tecnologia", label: "Tecnología", query: "Tecnología" },
+  { id: "ai", label: "AI", query: "Inteligencia Artificial" },
+];
+
+// --------- Proveedor HTTP real (cliente) ---------
+// Intenta pedir a /api/news?topic=... y devuelve el formato que usa la app.
+const HttpNewsProvider = {
+  async fetchNewsByTopic(topic) {
+    const res = await fetch(`/api/news?topic=${encodeURIComponent(topic)}`);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    // Se espera que el backend devuelva { articles: [...] }
+    return (data.articles || []).map((a, idx) => ({
+      id: a.id || `${topic}-${idx}`,
+      title: a.title,
+      date: a.date || (a.publishedAt ? a.publishedAt.slice(0, 10) : ""),
+      sourceName: a.sourceName || (a.source?.name ?? "Desconocida"),
+      url: a.url,
+      content: a.summary || a.content || a.description || "",
+    }));
+  },
+};
+
+// --------- Proveedor de datos simulado ---------
+const FakeNewsProvider = {
+  async fetchNewsByTopic(topic) {
+    // Simula latencia
+    await new Promise((r) => setTimeout(r, 600));
+
+    // Genera 6 titulares de ejemplo con fechas recientes
+    const today = new Date();
+    const fmt = (d) => d.toISOString().slice(0, 10);
+
+    const examples = Array.from({ length: 6 }).map((_, i) => {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      return {
+        id: `${topic}-${i}`,
+        title: `${capitalize(topic)}: titular de ejemplo ${i + 1}`,
+        date: fmt(d),
+        sourceName: "Fuente de ejemplo",
+        url: "https://example.com/noticia",
+        content:
+          `Este es el cuerpo simulado de la noticia ${i + 1} sobre "${topic}". ` +
+          `Aquí iría el texto completo que devolvería tu backend (ChatGPT o la API que prefieras). ` +
+          `Incluye resumen, detalles, citas y cualquier contexto necesario.`,
+      };
+    });
+
+    return examples;
+  },
+};
+
+// --------- Utilidades ---------
+function capitalize(s = "") {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// --------- Componentes de Pantalla ---------
+function HomeScreen({ onPickTopic }) {
+  const [customTopic, setCustomTopic] = useState("");
+  const [open, setOpen] = useState(false);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+      className="max-w-xl mx-auto w-full"
+    >
+      <div className="text-center space-y-2 mb-8">
+        <h1 className="text-3xl font-bold">Noticias por Temas</h1>
+        <p className="text-muted-foreground">Selecciona un tema para ver titulares recientes.</p>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {CATEGORIES.map((c) => (
+          <Card key={c.id} className="hover:shadow-lg transition-shadow">
+            <CardHeader>
+              <CardTitle className="text-xl">{c.label}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <Button className="w-full" onClick={() => onPickTopic(c.query)}>
+                Ver noticias
+              </Button>
+            </CardContent>
+          </Card>
+        ))}
+
+        <Card className="sm:col-span-2 hover:shadow-lg transition-shadow">
+          <CardHeader>
+            <CardTitle className="text-xl">Otros temas</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Dialog open={open} onOpenChange={setOpen}>
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Escribe un tema (p.ej., Espacio, Salud, Economía...)"
+                  value={customTopic}
+                  onChange={(e) => setCustomTopic(e.target.value)}
+                  className="flex-1"
+                />
+                <DialogTrigger asChild>
+                  <Button variant="secondary">Elegir</Button>
+                </DialogTrigger>
+              </div>
+              <DialogContent className="sm:max-w-md">
+                <DialogHeader>
+                  <DialogTitle>Confirmar tema</DialogTitle>
+                </DialogHeader>
+                <p className="text-sm text-muted-foreground">
+                  Has seleccionado: <span className="font-medium">{customTopic || "(vacío)"}</span>
+                </p>
+                <div className="flex justify-end gap-2 mt-4">
+                  <Button variant="ghost" onClick={() => setOpen(false)}>Cancelar</Button>
+                  <Button
+                    onClick={() => {
+                      const t = (customTopic || "Tema personalizado").trim();
+                      setOpen(false);
+                      onPickTopic(t);
+                    }}
+                  >
+                    Continuar
+                  </Button>
+                </div>
+              </DialogContent>
+            </Dialog>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Separator className="my-8" />
+      <p className="text-xs text-center text-muted-foreground">
+        Demo: los datos se generan en cliente. Sustituye el proveedor por tu backend cuando quieras.
+      </p>
+    </motion.div>
+  );
+}
+
+function NewsListScreen({ topic, items, loading, onRefresh, onOpenItem, onBackHome }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+      className="max-w-3xl mx-auto w-full"
+    >
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-2xl font-semibold">{capitalize(topic)}</h2>
+        <div className="flex gap-2">
+          <Button variant="secondary" onClick={onRefresh}>Actualizar</Button>
+        </div>
+      </div>
+
+      {loading ? (
+        <Card>
+          <CardContent className="py-10 text-center">Cargando titulares…</CardContent>
+        </Card>
+      ) : items.length === 0 ? (
+        <Card>
+          <CardContent className="py-10 text-center text-muted-foreground">
+            No hay titulares disponibles. Prueba a actualizar o elige otro tema.
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="space-y-3">
+          {items.map((n) => (
+            <Card
+              key={n.id}
+              className="hover:shadow-md transition-shadow cursor-pointer"
+              onClick={() => onOpenItem(n)}
+            >
+              <CardHeader className="pb-2">
+                <CardTitle className="text-lg leading-tight">{n.title}</CardTitle>
+              </CardHeader>
+              <CardContent className="pt-0 text-sm text-muted-foreground">
+                Fecha: {n.date} · Origen: {n.sourceName}
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      <div className="mt-8">
+        <Button variant="ghost" onClick={onBackHome} className="w-full sm:w-auto">
+          ← Volver a la pantalla inicial
+        </Button>
+      </div>
+    </motion.div>
+  );
+}
+
+function NewsDetailScreen({ item, onBackToList }) {
+  if (!item) return null;
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+      className="max-w-3xl mx-auto w-full"
+    >
+      <h2 className="text-3xl font-bold mb-2 leading-tight">{item.title}</h2>
+      <p className="text-sm text-muted-foreground mb-6">Fecha: {item.date} · Origen: {item.sourceName}</p>
+
+      <Card className="mb-6">
+        <CardContent className="prose max-w-none py-6">
+          <p>{item.content}</p>
+        </CardContent>
+      </Card>
+
+      <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center justify-between">
+        <a href={item.url} target="_blank" rel="noreferrer" className="underline">
+          Ver fuente original
+        </a>
+        <Button variant="ghost" onClick={onBackToList}>
+          ← Volver a titulares
+        </Button>
+      </div>
+    </motion.div>
+  );
+}
+
+// --------- App principal ---------
+export default function NoticiasApp() {
+  const [view, setView] = useState("home"); // "home" | "list" | "detail"
+  const [topic, setTopic] = useState("");
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [activeItem, setActiveItem] = useState(null);
+
+  // Maneja navegación + fetch
+  const loadNews = async (t) => {
+    setLoading(true);
+    try {
+      // 1) Intento real vía backend
+      const data = await HttpNewsProvider.fetchNewsByTopic(t);
+      setItems(data);
+    } catch (err) {
+      console.warn("Fallo proveedor HTTP, usando datos simulados:", err);
+      // 2) Fallback a datos simulados para no romper la UX
+      const fallback = await FakeNewsProvider.fetchNewsByTopic(t);
+      setItems(fallback);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handlePickTopic = async (t) => {
+    const clean = t.trim() || "Tema";
+    setTopic(clean);
+    setView("list");
+    await loadNews(clean);
+  };
+
+  const handleOpenItem = (item) => {
+    setActiveItem(item);
+    setView("detail");
+  };
+
+  const handleBackHome = () => {
+    setView("home");
+    setTopic("");
+    setItems([]);
+    setActiveItem(null);
+  };
+
+  const handleBackToList = () => {
+    setView("list");
+    setActiveItem(null);
+  };
+
+  // Contenedor y layout
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-background to-muted p-4 sm:p-8">
+      <div className="mx-auto w-full max-w-5xl">
+        <Header onHome={handleBackHome} canGoHome={view !== "home"} />
+
+        <AnimatePresence mode="wait">
+          {view === "home" && (
+            <motion.div key="home" exit={{ opacity: 0, y: -8 }}>
+              <HomeScreen onPickTopic={handlePickTopic} />
+            </motion.div>
+          )}
+
+          {view === "list" && (
+            <motion.div key="list" exit={{ opacity: 0, y: -8 }}>
+              <NewsListScreen
+                topic={topic}
+                items={items}
+                loading={loading}
+                onRefresh={() => loadNews(topic)}
+                onOpenItem={handleOpenItem}
+                onBackHome={handleBackHome}
+              />
+            </motion.div>
+          )}
+
+          {view === "detail" && (
+            <motion.div key="detail" exit={{ opacity: 0, y: -8 }}>
+              <NewsDetailScreen item={activeItem} onBackToList={handleBackToList} />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      <Footer />
+    </div>
+  );
+}
+
+function Header({ onHome, canGoHome }) {
+  return (
+    <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center gap-3">
+        <div className="h-10 w-10 rounded-2xl bg-primary/10 grid place-items-center font-bold">N</div>
+        <span className="font-semibold text-lg">NewsHub</span>
+      </div>
+      {canGoHome ? (
+        <Button variant="ghost" onClick={onHome}>Inicio</Button>
+      ) : (
+        <div className="text-sm text-muted-foreground">HTML5 · React · Demo</div>
+      )}
+    </div>
+  );
+}
+
+function Footer() {
+  return (
+    <div className="mt-10 text-center text-xs text-muted-foreground">
+      <p>
+        Titulares por tema. Si hay backend en /api/news se usan noticias reales; si falla, se muestran datos de demo.
+      </p>
+    </div>
+  );
+}
