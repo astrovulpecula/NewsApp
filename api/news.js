@@ -60,16 +60,16 @@ module.exports = async (req, res) => {
     // 1) Construir consulta según tema
     const cfg = getTopicConfig(topicRaw);
 
-    // 2) Llamar a NewsAPI (últimos 7 días, español, buscando sobre todo en títulos y descripción)
+    // 2) Llamar a NewsAPI (últimos 3 días, español, buscando sobre todo en títulos y descripción)
     const from = new Date();
-    from.setDate(from.getDate() - 7);
+    from.setDate(from.getDate() - 3);
     const params = new URLSearchParams({
       q: cfg.q,
       language: 'es',
       sortBy: 'publishedAt',
       searchIn: 'title,description',
       from: from.toISOString().slice(0,10),
-      pageSize: '25', // traer más y luego filtrar
+      pageSize: '50', // traer más y luego filtrar
     });
     const newsURL = `https://newsapi.org/v2/everything?${params}`;
 
@@ -86,13 +86,51 @@ module.exports = async (req, res) => {
       return res.status(200).json({ articles: [], warning: `NewsAPI fetch failed: ${String(err)}` });
     }
 
-    // 3) Filtro extra en servidor (por si NewsAPI mete ruido)
-    const filtered = raw.filter((a) => {
+    // 3) Filtro extra en servidor (por si NewsAPI mete ruido) + ranking por relevancia y recencia (72h)
+    function hoursAgo(iso) {
+      const t = new Date(iso).getTime();
+      if (!t) return 9999;
+      return (Date.now() - t) / (1000 * 60 * 60);
+    }
+
+    function relevanceScore(cfg, a) {
+      const title = (a.title || "");
+      const desc = (a.description || "");
+      let score = 0;
+      // Coincidencias en título pesan más que en descripción
+      if (cfg.include) {
+        cfg.include.forEach((re) => {
+          if (re.test(title)) score += 3;
+          else if (re.test(desc)) score += 1.5;
+        });
+      }
+      if (cfg.exclude) {
+        cfg.exclude.forEach((re) => {
+          if (re.test(title) || re.test(desc)) score -= 5;
+        });
+      }
+      // Recencia: dentro de 72h obtiene bonificación (0..2)
+      const h = hoursAgo(a.publishedAt);
+      if (isFinite(h)) {
+        const rec = Math.max(0, 72 - h) / 72; // 0..1
+        score += rec * 2;
+      }
+      return score;
+    }
+
+    const filteredBase = raw.filter((a) => {
       const text = `${a.title || ''} ${a.description || ''}`;
       const okInclude = cfg.include ? cfg.include.some((re) => re.test(text)) : true;
       const okExclude = cfg.exclude ? !cfg.exclude.some((re) => re.test(text)) : true;
       return okInclude && okExclude;
-    }).slice(0, 12); // nos quedamos con 12 máximo tras filtrar
+    });
+
+    // Ordenar por score descendente y quedarnos con TOP 5
+    const filtered = filteredBase
+      .map((a) => ({ a, score: relevanceScore(cfg, a) }))
+      .sort((x, y) => y.score - x.score)
+      .slice(0, 5)
+      .map((x) => x.a);
 
     // 4) Resumen con OpenAI si hay clave; si no, usar descripción
     async function summarize(a) {
