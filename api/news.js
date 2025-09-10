@@ -1,4 +1,4 @@
-    const { limit: limitParam, q: extraQ, hours: hoursParam } = req.query || {};// api/news.js — 48h ROBUSTO (debug + fallback + traducción + 5–10 líneas + imágenes)
+// api/news.js — 48h ROBUSTO (debug + fallback + traducción + 5–10 líneas + imágenes)
 // Compatible con runtimes Node 18+ (Next.js / Vercel / Express middleware estilo handler)
 // Hace crawling sobre GDELT (gratis) y usa r.jina.ai para extraer el texto del artículo.
 // Requisitos de negocio cubiertos:
@@ -27,7 +27,7 @@ export default async function handler(req, res) {
     const startTS = Date.now();
 
     const rawCat = (req.query?.category || req.query?.cat || '').toString().trim();
-    const { limit: limitParam, q: extraQ } = req.query || {};
+    const { limit: limitParam, q: extraQ, hours: hoursParam } = req.query || {};
     const limit = clampInt(parseInt(limitParam, 10) || 20, 5, 50);
     const hours = clampInt(parseInt(hoursParam, 10) || 48, 6, 168); // 6h–168h (1 semana máx)
     const minutesWindow = hours * 60;
