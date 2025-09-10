@@ -1,15 +1,15 @@
-// api/news.js — 24h ROBUSTO (debug + fallback + traducción + 5–10 líneas + imágenes)
+    const { limit: limitParam, q: extraQ, hours: hoursParam } = req.query || {};// api/news.js — 48h ROBUSTO (debug + fallback + traducción + 5–10 líneas + imágenes)
 // Compatible con runtimes Node 18+ (Next.js / Vercel / Express middleware estilo handler)
 // Hace crawling sobre GDELT (gratis) y usa r.jina.ai para extraer el texto del artículo.
 // Requisitos de negocio cubiertos:
-//  - Solo últimas 24h (timelimit=1440)
+//  - Ventana por defecto: últimas 48h (timelimit configurable via ?hours=)
 //  - Resumen 5–10 líneas
 //  - Español primero; las noticias en inglés van al final y marcan (ENG)
 //  - Fallback de imagen (placeholder por categoría)
 //  - De-dupe por URL/título
 //  - Modo DEBUG con trazas y cabeceras X-Debug-*
 //  - Normalización robusta de categorías y sinónimos
-//  - Si una categoría no encuentra nada en 24h, se hace búsqueda ampliada por sinónimos (misma ventana 24h)
+//  - Si una categoría no encuentra nada, se reintenta ampliando criterios en la misma ventana temporal
 
 export default async function handler(req, res) {
   try {
@@ -29,12 +29,19 @@ export default async function handler(req, res) {
     const rawCat = (req.query?.category || req.query?.cat || '').toString().trim();
     const { limit: limitParam, q: extraQ } = req.query || {};
     const limit = clampInt(parseInt(limitParam, 10) || 20, 5, 50);
+    const hours = clampInt(parseInt(hoursParam, 10) || 48, 6, 168); // 6h–168h (1 semana máx)
+    const minutesWindow = hours * 60;
 
     const norm = normalizeCategory(rawCat);
     const qterms = buildQueryTerms(norm, extraQ);
 
-    // Buscamos en GDELT últimos 1440 minutos (24h)
-    const results = await fetchFromGDELT(qterms, 1440, limit * 3); // pedimos más para filtrar/dedup
+    // Buscamos en GDELT en la ventana solicitada (por defecto 48h)
+    let results = await fetchFromGDELT(qterms, minutesWindow, limit * 3); // pedimos más para filtrar/dedup
+
+    // Fallback: si no hay nada, reintentamos sin restricción de idioma (para rescatar lo que sea relevante)
+    if (!results.length) {
+      results = await fetchFromGDELT(qterms, minutesWindow, limit * 3, { anyLang: true });
+    }
 
     // Dedupe básico por URL y título (case-insensitive)
     const deduped = dedupeArticles(results);
@@ -54,10 +61,11 @@ export default async function handler(req, res) {
     // Si no hay resultados, devolvemos estructura vacía pero con debugging explícito
     if (!ordered.length) {
       const dbg = {
-        note: 'Sin resultados en 24h para la categoría dada. Revise el slug o pruebe sinónimos.',
+        note: `Sin resultados en ${hours}h para la categoría dada. Revise el slug o pruebe sinónimos.`,
         received_category: rawCat || '(vacío)',
         normalized_key: norm.key,
         synonyms: qterms.synonyms,
+        hours,
       };
       res
         .setHeader('X-Debug-Note', encodeURIComponent(JSON.stringify(dbg)))
@@ -72,6 +80,7 @@ export default async function handler(req, res) {
       .setHeader('X-Debug-Synonyms', encodeURIComponent(qterms.synonyms.join(',')))
       .setHeader('X-Debug-Count', String(ordered.length))
       .setHeader('X-Debug-TimeMs', String(elapsed))
+      .setHeader('X-Debug-Hours', String(hours))
       .status(200)
       .json({ ok: true, category: norm, items: ordered });
   } catch (err) {
@@ -129,35 +138,56 @@ function buildQueryTerms(norm, extraQ) {
   return { synonyms };
 }
 
-async function fetchFromGDELT(qterms, minutesWindow, maxRecords = 60) {
-  // Construimos query OR con sinónimos, priorizando español primero
-  // GDELT: https://api.gdeltproject.org/api/v2/doc/doc?query=...&format=json&maxrecords=50&sort=DateDesc&timelimit=1440
+async function fetchFromGDELT(qterms, minutesWindow, maxRecords = 60, opts = {}) {
+  // Construimos query OR con sinónimos
   const base = 'https://api.gdeltproject.org/api/v2/doc/doc';
   const enc = (s) => encodeURIComponent(s);
 
-  // español
-  const qES = enc(qterms.synonyms.map(t => `(${t})`).join(' OR ') + ' sourcelang:spa');
-  const urlES = `${base}?query=${qES}&mode=ArtList&maxrecords=${Math.min(maxRecords, 100)}&sort=DateDesc&format=json&timelimit=${minutesWindow}`;
+  const coreQuery = enc(qterms.synonyms.map(t => `(${t})`).join(' OR '));
 
-  // inglés
-  const qEN = enc(qterms.synonyms.map(t => `(${t})`).join(' OR ') + ' sourcelang:eng');
-  const urlEN = `${base}?query=${qEN}&mode=ArtList&maxrecords=${Math.min(maxRecords, 100)}&sort=DateDesc&format=json&timelimit=${minutesWindow}`;
+  let urls = [];
+  if (opts.anyLang) {
+    const qAny = `${coreQuery}`; // sin filtro de idioma
+    const urlAny = `${base}?query=${qAny}&mode=ArtList&maxrecords=${Math.min(maxRecords, 100)}&sort=DateDesc&format=json&timelimit=${minutesWindow}`;
+    urls = [urlAny];
+  } else {
+    const qES = `${coreQuery}%20sourcelang:spa`;
+    const qEN = `${coreQuery}%20sourcelang:eng`;
+    urls = [
+      `${base}?query=${qES}&mode=ArtList&maxrecords=${Math.min(maxRecords, 100)}&sort=DateDesc&format=json&timelimit=${minutesWindow}`,
+      `${base}?query=${qEN}&mode=ArtList&maxrecords=${Math.min(maxRecords, 100)}&sort=DateDesc&format=json&timelimit=${minutesWindow}`,
+    ];
+  }
 
-  const [esRes, enRes] = await Promise.all([safeJsonFetch(urlES), safeJsonFetch(urlEN)]);
+  const jsons = await Promise.all(urls.map(u => safeJsonFetch(u)));
 
   const collect = (json, langCode) => (json?.articles || []).map(a => ({
     title: a.title?.trim(),
     url: a.url,
-    language: langCode === 'es' ? 'es' : 'en',
+    language: langCode || (a.language || 'en'),
     source: a.sourceCommonName || a.domain || a.source || '',
     publishedAt: a.seenDate ? Date.parse(a.seenDate) : (a.date ? Date.parse(a.date) : Date.now()),
     image: a.socialImage || a.image || null,
   }));
 
-  const esItems = collect(esRes, 'es');
-  const enItems = collect(enRes, 'en');
+  if (opts.anyLang) {
+    // cuando no filtramos idioma, intentamos inferir ES por heurística simple sobre título
+    const any = collect(jsons[0], null).map(it => ({
+      ...it,
+      language: looksSpanish(it.title) ? 'es' : 'en',
+    }));
+    return any;
+  }
 
+  const esItems = collect(jsons[0], 'es');
+  const enItems = collect(jsons[1], 'en');
   return esItems.concat(enItems);
+}
+
+function looksSpanish(text = '') {
+  const t = text.toLowerCase();
+  const hits = [' el ', ' la ', ' los ', ' las ', ' de ', ' en ', ' y ', ' con ', ' para ', ' españa', ' méxico', ' chile', ' argentina'];
+  return hits.some(h => t.includes(h));
 }
 
 function dedupeArticles(items) {
