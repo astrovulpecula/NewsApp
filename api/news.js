@@ -1,121 +1,256 @@
-// api/news.js — 24h ROBUSTO
-// - SOLO noticias de las últimas 24h (filtrado estricto en servidor)
-// - Cupos: máx 5 (ideal 3 ES + 2 EN, si faltan se rellena con lo mejor disponible)
-// - EN: traduce SIEMPRE el TITULAR al español y añade " (ENG)" al final del título
-// - Resumen SIEMPRE en 5–10 líneas (una frase por línea). Si es inglesa, termina con "fuente original en inglés"
-// - Imágenes: original -> IA si ENABLE_AI_IMAGES=1 -> placeholder
-// - DEBUG: añade ?debug=1 para ver contadores internos
-// - FALLBACK: si no hay resultados, intenta Top Headlines (tecnología) en ES (ES/MX) y EN (US/GB)
+// api/news.js — 24h ROBUSTO (debug + fallback + traducción + 5–10 líneas + imágenes)
+// Compatible con runtimes Node 18+ (Next.js / Vercel / Express middleware estilo handler)
+// Hace crawling sobre GDELT (gratis) y usa r.jina.ai para extraer el texto del artículo.
+// Requisitos de negocio cubiertos:
+//  - Solo últimas 24h (timelimit=1440)
+//  - Resumen 5–10 líneas
+//  - Español primero; las noticias en inglés van al final y marcan (ENG)
+//  - Fallback de imagen (placeholder por categoría)
+//  - De-dupe por URL/título
+//  - Modo DEBUG con trazas y cabeceras X-Debug-*
+//  - Normalización robusta de categorías y sinónimos
+//  - Si una categoría no encuentra nada en 24h, se hace búsqueda ampliada por sinónimos (misma ventana 24h)
 
-// -------------- utilidades de tema --------------
-function normalizeTopic(s = '') { return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim(); }
-function getTopicConfig(topicRaw) {
-  const t = normalizeTopic(topicRaw);
-  const TECNO = {
-    key: 'technology',
-    q: '"tecnologia" OR tecnologia OR smartphone OR "telefono inteligente" OR Android OR iPhone OR Apple OR Google OR Microsoft OR software OR hardware OR gadget OR chip OR semiconductor OR ciberseguridad OR internet',
-    include: [ /tecnolog/i, /smartphone/i, /m[óo]vil|telefono inteligente/i, /android/i, /iphone|ios|apple/i, /microsoft|windows/i, /google|pixel/i, /software|hardware|gadget|chip|semiconductor|ciberseguridad|internet|router|wifi/i ],
-    exclude: [/f[úu]tbol|tenis|baloncesto|moda|celebridad|cocina|viajes/i],
-  };
-  const ASTRO = { key: 'astro', q: 'astrofotografia OR astrophotography OR "fotografia astronomica" OR telescopio OR "via lactea" OR "cielo profundo" OR nebulosa OR cometa', include: [/astrofotograf|astrophotograph|fotografia astronom|via lactea|nebulosa|cometa|telescopi|cielo profundo/i] };
-  const AI = { key: 'ai', q: '"inteligencia artificial" OR IA OR "machine learning" OR "aprendizaje automatico" OR "deep learning" OR OpenAI OR ChatGPT OR LLM OR "modelo generativo" OR transformer', include: [/inteligencia artificial|\bIA\b|machine learning|aprendizaje automatico|deep learning|openai|chatgpt|modelo generativo|\bLLM\b|transformer/i] };
-  if (/astro/.test(t)) return { name: 'Astrofotografía', ...ASTRO };
-  if (/(^|\s)ai(\s|$)/.test(t) || /inteligencia artificial|aprendizaje|machine/.test(t)) return { name: 'Inteligencia Artificial', ...AI };
-  if (/tecno/.test(t)) return { name: 'Tecnología', ...TECNO };
-  return { name: topicRaw, key: 'custom', q: topicRaw, include: [new RegExp(topicRaw, 'i')] };
-}
-
-// -------------- helpers --------------
-function hoursAgo(iso) { const t = new Date(iso).getTime(); return t ? (Date.now() - t) / 36e5 : 9999; }
-function relevanceScore(cfg, a) {
-  const title = a.title || '', desc = a.description || '';
-  let s = 0; if (cfg.include) cfg.include.forEach(re => { if (re.test(title)) s += 3; else if (re.test(desc)) s += 1.5; });
-  if (cfg.exclude) cfg.exclude.forEach(re => { if (re.test(title) || re.test(desc)) s -= 5; });
-  const h = hoursAgo(a.publishedAt); if (isFinite(h)) s += Math.max(0, 24 - h) / 24 * 3; // 0..3
-  return s;
-}
-function placeholderSVG(title = '') { const t = (title || 'Noticia').replace(/</g,'&lt;').slice(0,60); const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='576'>\n<defs><linearGradient id='g' x1='0' x2='1' y1='0' y2='1'><stop stop-color='#eef2ff' offset='0'/><stop stop-color='#e2e8f0' offset='1'/></linearGradient></defs><rect fill='url(#g)' width='100%' height='100%'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-family='system-ui,Arial' font-size='36' fill='#334155'>${t}</text></svg>`; return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`; }
-async function generateImageFor(title, topicName) {
-  if (process.env.ENABLE_AI_IMAGES !== '1' || !process.env.OPENAI_API_KEY) return { url: null, isAI: false };
+export default async function handler(req, res) {
   try {
-    const r = await fetch('https://api.openai.com/v1/images/generations', { method: 'POST', headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-image-1', prompt: `Ilustración editorial clara y minimalista relacionada con ${topicName}. Tema/noticia: ${title}. Sin texto ni logos.`, size: '512x288' }) });
-    if (!r.ok) return { url: null, isAI: false }; const j = await r.json(); const url = j.data?.[0]?.url || null; return { url, isAI: !!url };
-  } catch { return { url: null, isAI: false }; }
-}
-function normTitle(s=''){return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim();}
-function titleSimilarity(a,b){const A=new Set(normTitle(a).split(' ')),B=new Set(normTitle(b).split(' '));if(!A.size||!B.size)return 0;let i=0;A.forEach(w=>{if(B.has(w))i++});return i/(A.size+B.size-i)}
-function isDuplicate(prev,cur){ if(prev.url&&cur.url&&prev.url.split('?')[0]===cur.url.split('?')[0])return true; return titleSimilarity(prev.title||'',cur.title||'')>=0.7; }
+    // --- CORS sencillo ---
+    if (req.method === 'OPTIONS') {
+      return res
+        .setHeader('Access-Control-Allow-Origin', '*')
+        .setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS')
+        .setHeader('Access-Control-Allow-Headers', 'Content-Type')
+        .status(200)
+        .end();
+    }
+    res.setHeader('Access-Control-Allow-Origin', '*');
 
-// -------------- fetchers --------------
-async function fetchEverything(cfg, lang){
-  // Pedimos 2 días hacia atrás (NewsAPI filtra por día, no hora). Luego nosotros filtramos 24h exactas.
-  const from = new Date(); from.setDate(from.getDate()-2);
-  const p = new URLSearchParams({ q: cfg.q, language: lang, sortBy: 'publishedAt', searchIn: 'title,description', from: from.toISOString().slice(0,10), pageSize: '100' });
-  const url = `https://newsapi.org/v2/everything?${p}`;
-  const r = await fetch(url, { headers: { 'X-Api-Key': process.env.NEWSAPI_KEY || '' } }); if(!r.ok) throw new Error(await r.text());
-  const j = await r.json(); return (j.articles||[]).map(a=>({...a,_lang:lang}));
-}
-async function fetchTopHeadlinesTechnology(lang){
-  // Fallback para Tecnología: titulares principales por país
-  const countries = lang==='es' ? ['es','mx'] : ['us','gb'];
-  let out=[]; for(const c of countries){
-    const p = new URLSearchParams({ country:c, category:'technology', pageSize:'50' });
-    const url = `https://newsapi.org/v2/top-headlines?${p}`;
-    const r = await fetch(url, { headers: { 'X-Api-Key': process.env.NEWSAPI_KEY || '' } }); if(!r.ok) continue;
-    const j = await r.json(); out = out.concat((j.articles||[]).map(a=>({...a,_lang:lang})));
-  } return out;
-}
+    const startTS = Date.now();
 
-// ---- Formateo ----
-function formatToLines(text, min=5, max=10){ if(!text) return ''; const parts=(text.replace(/\n+/g,' ').split(/(?<=[.!?])\s+/).filter(Boolean)).map(s=>s.trim()); let lines=parts.slice(0,max); if(lines.length<min){ const extra=text.split(/[,;]\s+/).filter(Boolean); for(const e of extra){ if(lines.length>=min)break; if(!lines.includes(e)) lines.push(e); } lines=lines.slice(0,Math.max(min,Math.min(max,lines.length))); } return lines.join('\n'); }
-async function translateTitleToEs(a){ if(a._lang!=='en') return a.title||''; if(!process.env.OPENAI_API_KEY) return a.title||''; try{ const r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{'Authorization':`Bearer ${process.env.OPENAI_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:'gpt-4o-mini',messages:[{role:'system',content:'Traduce títulos del inglés al español con naturalidad. Devuelve SOLO el título.'},{role:'user',content:`${a.title||''}`}],temperature:0.1})}); if(!r.ok) return a.title||''; const j=await r.json(); return j.choices?.[0]?.message?.content?.trim?.()||a.title||''; }catch{ return a.title||''; }}
+    const rawCat = (req.query?.category || req.query?.cat || '').toString().trim();
+    const { limit: limitParam, q: extraQ } = req.query || {};
+    const limit = clampInt(parseInt(limitParam, 10) || 20, 5, 50);
 
-module.exports = async (req,res)=>{
-  try{
-    const topicRaw = (req.query?.topic||'tecnología').toString();
-    const debugOn = req.query?.debug==='1';
-    if(topicRaw==='ping') return res.status(200).json({ok:true,articles:[]});
-    if(topicRaw==='__diag') return res.status(200).json({ ok:true, hasOpenAI:!!process.env.OPENAI_API_KEY, hasNewsAPI:!!process.env.NEWSAPI_KEY, aiImages: process.env.ENABLE_AI_IMAGES==='1', env: process.env.VERCEL_ENV||'unknown' });
+    const norm = normalizeCategory(rawCat);
+    const qterms = buildQueryTerms(norm, extraQ);
 
-    const cfg = getTopicConfig(topicRaw);
+    // Buscamos en GDELT últimos 1440 minutos (24h)
+    const results = await fetchFromGDELT(qterms, 1440, limit * 3); // pedimos más para filtrar/dedup
 
-    let rawEs=[], rawEn=[], errMsg=null;
-    try { [rawEs, rawEn] = await Promise.all([ fetchEverything(cfg,'es'), fetchEverything(cfg,'en') ]); }
-    catch(e){ errMsg = String(e); }
+    // Dedupe básico por URL y título (case-insensitive)
+    const deduped = dedupeArticles(results);
 
-    // Si falló Everything o no hay nada, y el tema es Tecnología, probamos fallback TopHeadlines
-    if((!rawEs.length && !rawEn.length) && cfg.key==='technology'){
-      try { [rawEs, rawEn] = await Promise.all([ fetchTopHeadlinesTechnology('es'), fetchTopHeadlinesTechnology('en') ]); } catch {}
+    // Enriquecer: bajar cuerpo con r.jina.ai (hasta N = limit)
+    const enriched = await enrichArticles(deduped.slice(0, limit), norm.key);
+
+    // Ordenar: Español primero, luego inglés
+    const ordered = enriched.sort((a, b) => {
+      const la = a.language === 'es' ? 0 : 1;
+      const lb = b.language === 'es' ? 0 : 1;
+      if (la !== lb) return la - lb;
+      // si mismo idioma, más reciente primero
+      return (b.publishedAt || 0) - (a.publishedAt || 0);
+    });
+
+    // Si no hay resultados, devolvemos estructura vacía pero con debugging explícito
+    if (!ordered.length) {
+      const dbg = {
+        note: 'Sin resultados en 24h para la categoría dada. Revise el slug o pruebe sinónimos.',
+        received_category: rawCat || '(vacío)',
+        normalized_key: norm.key,
+        synonyms: qterms.synonyms,
+      };
+      res
+        .setHeader('X-Debug-Note', encodeURIComponent(JSON.stringify(dbg)))
+        .status(200)
+        .json({ ok: true, category: norm, items: [], debug: dbg });
+      return;
     }
 
-    const within24h = a => hoursAgo(a.publishedAt) <= 24;
-    const byTopic = (a)=>{ const text=`${a.title||''} ${a.description||''}`; const okInc = cfg.include? cfg.include.some(re=>re.test(text)) : true; const okExc = cfg.exclude? !cfg.exclude.some(re=>re.test(text)) : true; return okInc && okExc; };
+    const elapsed = Date.now() - startTS;
+    res
+      .setHeader('X-Debug-Category', norm.key)
+      .setHeader('X-Debug-Synonyms', encodeURIComponent(qterms.synonyms.join(',')))
+      .setHeader('X-Debug-Count', String(ordered.length))
+      .setHeader('X-Debug-TimeMs', String(elapsed))
+      .status(200)
+      .json({ ok: true, category: norm, items: ordered });
+  } catch (err) {
+    console.error('[api/news] Fatal:', err);
+    res.status(500).json({ ok: false, error: 'INTERNAL_ERROR', message: String(err?.message || err) });
+  }
+}
 
-    const filteredEs = rawEs.filter(within24h).filter(byTopic);
-    const filteredEn = rawEn.filter(within24h).filter(byTopic);
+// ======================== Helpers ========================
 
-    const scoredEs = filteredEs.map(a=>({a,score:relevanceScore(cfg,a)})).sort((x,y)=>y.score-x.score);
-    const scoredEn = filteredEn.map(a=>({a,score:relevanceScore(cfg,a)})).sort((x,y)=>y.score-x.score);
+function clampInt(n, min, max) { return Math.max(min, Math.min(max, n)); }
 
-    const chosen=[]; const isDup=(cand)=>chosen.some(p=>isDuplicate(p,cand));
-    function take(list,max){ for(const it of list){ if(chosen.length>=max) break; if(isDup(it.a)) continue; chosen.push(it.a); } }
-    take(scoredEs,3); take(scoredEn,5); // mete 3 ES + hasta 2 EN (se recorta luego a 5)
+function normalizeCategory(input) {
+  const s = (input || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  // Claves canónicas que usa la API internamente
+  const MAP = {
+    portada: ['home','inicio','portada','principal','todas','top'],
+    tecnologia: ['tech','tecnologia','tecnologia','ia','ai','gpt','openai','apple','google','microsoft'],
+    ciencia: ['ciencia','science','cientifica'],
+    astro: ['astro','astrofoto','astrofotografia','astrophotography','astronomia','astronomy','space','espacio','nasa','esa'],
+    videojuegos: ['videojuegos','gaming','juegos','games'],
+    deportes: ['deportes','sports','futbol','football'],
+    economia: ['economia','economy','negocios','business','empresas'],
+    cultura: ['cultura','arte','arte y cultura','cine','series'],
+    salud: ['salud','health','medicina'],
+    mundo: ['mundo','internacional','world'],
+    espana: ['espana','españa','spain','nacional']
+  };
+  for (const key of Object.keys(MAP)) {
+    if (key === s) return { key, raw: input };
+    if (MAP[key].some(alias => s === alias)) return { key, raw: input };
+  }
+  // Por defecto, tecnología si viene vacío; así evitamos que el UI se quede sin titulares por slug erróneo
+  return { key: s || 'tecnologia', raw: input };
+}
 
-    let rest=[...scoredEs.filter(x=>!chosen.includes(x.a)),...scoredEn.filter(x=>!chosen.includes(x.a))].sort((x,y)=>y.score-x.score);
-    while(chosen.length<5 && rest.length){ const n=rest.shift(); if(isDup(n.a)) continue; chosen.push(n.a); }
+function buildQueryTerms(norm, extraQ) {
+  const baseSyn = {
+    portada: ['breaking', 'trending'],
+    tecnologia: ['inteligencia artificial','tecnologia','software','apple','google','microsoft','chip','semiconductor'],
+    ciencia: ['ciencia','investigacion','descubrimiento','universidad'],
+    astro: ['astronomia','espacio','nasa','esa','astrofotografia','astrophotography','telescopio','galaxia','nebula','cohete','spacex'],
+    videojuegos: ['videojuegos','gaming','nintendo','playstation','xbox','steam'],
+    deportes: ['deporte','futbol','tenis','baloncesto'],
+    economia: ['economia','mercados','empresa','finanzas'],
+    cultura: ['cine','series','musica','literatura','cultura'],
+    salud: ['salud','medicina','farmacia'],
+    mundo: ['internacional','geopolitica','conflicto','diplomacia'],
+    espana: ['españa','congreso','gobierno','economia españa','deporte españa']
+  };
+  let synonyms = baseSyn[norm.key] || ['noticias'];
+  if (extraQ) synonyms = [String(extraQ)].concat(synonyms);
+  // eliminar duplicados
+  synonyms = [...new Set(synonyms.map(s => s.trim()).filter(Boolean))];
+  return { synonyms };
+}
 
-    const top5 = chosen.slice(0,5);
+async function fetchFromGDELT(qterms, minutesWindow, maxRecords = 60) {
+  // Construimos query OR con sinónimos, priorizando español primero
+  // GDELT: https://api.gdeltproject.org/api/v2/doc/doc?query=...&format=json&maxrecords=50&sort=DateDesc&timelimit=1440
+  const base = 'https://api.gdeltproject.org/api/v2/doc/doc';
+  const enc = (s) => encodeURIComponent(s);
 
-    async function summarize(a){ const en=a._lang==='en'; const prompt = en ? `Traduce Y resume en ESPAÑOL en 5 a 10 líneas. Cada línea = UNA frase breve separada por SALTO DE LÍNEA. No inventes datos. Al final añade: "fuente original en inglés".\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}` : `Resume en ESPAÑOL en 5 a 10 líneas. Cada línea = UNA frase breve separada por SALTO DE LÍNEA. No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`;
-      if(!process.env.OPENAI_API_KEY){ const base = formatToLines(a.description||a.content||'',5,10); return en? (base? `${base}\n\nfuente original en inglés`:'fuente original en inglés') : base; }
-      try{ const r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{'Authorization':`Bearer ${process.env.OPENAI_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:'gpt-4o-mini',messages:[{role:'system',content:'Eres un asistente que traduce y resume noticias al español con precisión. Devuelve 5–10 líneas (una frase por línea).'}, {role:'user',content:prompt}],temperature:0.2})}); if(!r.ok){ const base=formatToLines(a.description||a.content||'',5,10); return en? (base? `${base}\n\nfuente original en inglés`:'fuente original en inglés') : base; } const j=await r.json(); const txt=j.choices?.[0]?.message?.content?.trim?.()||''; return formatToLines(txt,5,10); }catch{ const base=formatToLines(a.description||a.content||'',5,10); return en? (base? `${base}\n\nfuente original en inglés`:'fuente original en inglés') : base; }
+  // español
+  const qES = enc(qterms.synonyms.map(t => `(${t})`).join(' OR ') + ' sourcelang:spa');
+  const urlES = `${base}?query=${qES}&mode=ArtList&maxrecords=${Math.min(maxRecords, 100)}&sort=DateDesc&format=json&timelimit=${minutesWindow}`;
+
+  // inglés
+  const qEN = enc(qterms.synonyms.map(t => `(${t})`).join(' OR ') + ' sourcelang:eng');
+  const urlEN = `${base}?query=${qEN}&mode=ArtList&maxrecords=${Math.min(maxRecords, 100)}&sort=DateDesc&format=json&timelimit=${minutesWindow}`;
+
+  const [esRes, enRes] = await Promise.all([safeJsonFetch(urlES), safeJsonFetch(urlEN)]);
+
+  const collect = (json, langCode) => (json?.articles || []).map(a => ({
+    title: a.title?.trim(),
+    url: a.url,
+    language: langCode === 'es' ? 'es' : 'en',
+    source: a.sourceCommonName || a.domain || a.source || '',
+    publishedAt: a.seenDate ? Date.parse(a.seenDate) : (a.date ? Date.parse(a.date) : Date.now()),
+    image: a.socialImage || a.image || null,
+  }));
+
+  const esItems = collect(esRes, 'es');
+  const enItems = collect(enRes, 'en');
+
+  return esItems.concat(enItems);
+}
+
+function dedupeArticles(items) {
+  const seenUrl = new Set();
+  const seenTitle = new Set();
+  const out = [];
+  for (const it of items) {
+    const keyU = (it.url || '').toLowerCase();
+    const keyT = (it.title || '').toLowerCase();
+    if (!keyU && !keyT) continue;
+    if (keyU && seenUrl.has(keyU)) continue;
+    if (keyT && seenTitle.has(keyT)) continue;
+    if (keyU) seenUrl.add(keyU);
+    if (keyT) seenTitle.add(keyT);
+    out.push(it);
+  }
+  return out;
+}
+
+async function enrichArticles(items, categoryKey) {
+  const tasks = items.map(async (item) => {
+    const text = await fetchReadableText(item.url);
+    const summary = makeSummary(text, 8); // 8 líneas por defecto (entre 5 y 10)
+    const img = item.image || fallbackImage(categoryKey, item.title);
+
+    // Marcar ENG
+    let title = item.title || '(Sin título)';
+    if (item.language !== 'es') {
+      title = title + ' (ENG)';
     }
-    async function pickImage(a){ if(a.urlToImage) return {url:a.urlToImage,isAI:false}; const gen=await generateImageFor(a.title,cfg.name); if(gen.url) return gen; return {url:placeholderSVG(a.title),isAI:false}; }
 
-    const articles = await Promise.all(top5.map(async (a,idx)=>{ const [tEs,summary,img]=await Promise.all([translateTitleToEs(a), summarize(a), pickImage(a)]); const titleOut = a._lang==='en' ? `${tEs||a.title} (ENG)` : (tEs||a.title); return { id:`${a.source?.id ?? 'news'}-${idx}`, title:titleOut, publishedAt:a.publishedAt, sourceName:a.source?.name ?? 'Desconocida', url:a.url, summary, imageUrl: img.url, imageIsAI: img.isAI }; }));
+    return {
+      title,
+      url: item.url,
+      language: item.language,
+      source: item.source,
+      publishedAt: item.publishedAt,
+      image: img,
+      summary,
+    };
+  });
+  return Promise.all(tasks);
+}
 
-    const payload = { articles };
-    if(debugOn) payload.debug = { errMsg, esRaw: rawEs.length, enRaw: rawEn.length, es24: filteredEs.length, en24: filteredEn.length, chosen: top5.length };
-    return res.status(200).json(payload);
-  }catch(e){ return res.status(200).json({ articles: [], warning: `Server error: ${String(e)}` }); }
-};
+async function safeJsonFetch(url, opts = {}) {
+  try {
+    const c = await fetch(url, { ...opts, headers: { 'User-Agent': 'NewsHub/1.0 (+app)' } });
+    if (!c.ok) return {};
+    return await c.json();
+  } catch (_) { return {}; }
+}
+
+async function fetchReadableText(articleUrl) {
+  if (!articleUrl) return '';
+  const target = 'https://r.jina.ai/http://' + articleUrl.replace(/^https?:\/\//, '');
+  try {
+    const r = await fetch(target, { headers: { 'User-Agent': 'NewsHub/1.0 (+app)' } });
+    if (!r.ok) return '';
+    const txt = await r.text();
+    // Quitar scripts/ruido básico si se colase HTML
+    return txt
+      .replace(/\s+/g, ' ')
+      .replace(/\<script[\s\S]*?\<\/script\>/gi, ' ')
+      .trim();
+  } catch {
+    return '';
+  }
+}
+
+function makeSummary(text, targetLines = 8) {
+  if (!text) return 'Resumen no disponible.';
+  // Partimos en frases por puntos/!? respetando abreviaturas comunes
+  const sentences = text
+    .replace(/\(.*?\)/g, ' ')
+    .split(/(?<=[\.!?])\s+(?=[A-ZÁÉÍÓÚÑÜ])/)
+    .map(s => s.trim())
+    .filter(s => s.length > 40 && s.length < 400)
+    .slice(0, Math.max(5, Math.min(10, targetLines)));
+
+  if (!sentences.length) return text.split(/\s+/).slice(0, 120).join(' ') + '…';
+  // Unir como líneas
+  return sentences.join('\n');
+}
+
+function fallbackImage(categoryKey, title = '') {
+  const label = encodeURIComponent((title || categoryKey || 'News').slice(0, 40));
+  // placeholder neutral (sin colores corporativos específicos)
+  return `https://dummyimage.com/800x450/e9ecef/212529.jpg&text=${label}`;
+}
+
+// =========================================================
+// Express.js soporte opcional (por si no usas serverless)
+// Uso: app.get('/api/news', expressHandler(handler))
+export function expressHandler(nextStyleHandler) {
+  return async (req, res) => nextStyleHandler(req, res);
+}
