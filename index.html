@@ -30,8 +30,7 @@
     <header class="grid" style="margin-bottom:16px; align-items:center; grid-template-columns: auto 1fr auto; gap:12px;">
       <div style="width:40px;height:40px;border-radius:12px;background:#111;color:#fff;display:grid;place-items:center;font-weight:700">N</div>
       <div>
-        <strong>NewsHub</strong>
-        <div class="muted" style="font-size:12px">HTML5 · Vanilla</div>
+        <strong>5' news</strong>
       </div>
       <div id="connBadge" class="badge">Comprobando…</div>
     </header>
@@ -39,7 +38,7 @@
     <!-- Pantalla 1: Home -->
     <section id="view-home" class="grid">
       <div class="card">
-        <h1>Noticias por Temas</h1>
+        <h1 id="greeting">Hola</h1>
         <p class="muted">Selecciona un tema para ver titulares recientes.</p>
       </div>
       <div class="grid grid2">
@@ -163,6 +162,34 @@
     function backToList() { show("list"); }
     function refresh() { loadNews(); }
 
+    
+// === Saludo dinámico ===
+// Reglas solicitadas:
+// - 07:00–11:59  -> "buenos días"
+// - 12:00–20:00  -> "Buenas noches"
+// - 20:01–06:59  -> "buenas noches"
+function applyGreeting() {
+  const elG = document.getElementById("greeting");
+  if (!elG) return;
+  const now = new Date();
+  const h = now.getHours();
+  const m = now.getMinutes();
+  let saludo = "buenas noches"; // por defecto
+
+  if (h >= 7 && h < 12) {
+    saludo = "buenos días";
+  } else if ((h > 12 && h < 20) || (h === 12) || (h === 20 && m === 0)) {
+    // De 12:00 a 20:00 (incluye 20:00 exacto)
+    saludo = "Buenas noches";
+  } else if (h > 20 || (h === 20 && m >= 1) || h < 7) {
+    // De 20:01 a 06:59
+    saludo = "buenas noches";
+  }
+
+  elG.textContent = saludo;
+}
+
+    applyGreeting();
     pingBackend();
   </script>
 </body>
