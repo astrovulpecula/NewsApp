@@ -1,8 +1,10 @@
-// api/news.js — FINAL
-// Ventana: 48h · Top 5 con cupos: 3 ES + 2 EN (rellena si falta) · Dedupe por URL/título
-// Titulares: si la noticia es EN, se traduce SIEMPRE el titular al español
-// Resúmenes: 5–10 líneas (una frase por línea); si EN, añade "fuente original en inglés"
-// Imágenes: usa urlToImage; si falta y ENABLE_AI_IMAGES=1, genera con OpenAI; si no, placeholder
+// api/news.js — 24h + titulares traducidos + 5–10 líneas + (ENG) + cupos (3 ES + 2 EN con relleno) + dedupe + imágenes + endpoint de fallback IA
+// - SOLO noticias de las últimas 24h (filtro estricto en servidor)
+// - Máx 5 noticias por tema, intentando 3 ES + 2 EN; si faltan, rellena con lo mejor disponible
+// - Si la fuente es inglesa: traduce SIEMPRE el TITULAR al español y añade " (ENG)" al final del titular
+// - Resumen SIEMPRE en 5–10 líneas (una frase por línea). Si es inglesa, termina con "fuente original en inglés"
+// - Imágenes: usa urlToImage; si no hay y ENABLE_AI_IMAGES=1, genera con OpenAI; si no, placeholder
+// - NUEVO: endpoint de emergencia para imágenes rotas en el front: /api/news?topic=__make_img&title=...
 
 function normalizeTopic(s = '') {
   return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
@@ -52,7 +54,7 @@ function relevanceScore(cfg, a) {
     cfg.exclude.forEach((re) => { if (re.test(title) || re.test(desc)) score -= 5; });
   }
   const h = hoursAgo(a.publishedAt);
-  if (isFinite(h)) { const rec = Math.max(0, 48 - h) / 48; score += Math.max(0, rec) * 3; }
+  if (isFinite(h)) { const rec = Math.max(0, 24 - h) / 24; score += Math.max(0, rec) * 3; }
   return score;
 }
 
@@ -97,7 +99,8 @@ function isDuplicate(prev, cur){
 }
 
 async function fetchNewsFor(cfg, lang) {
-  const from = new Date(); from.setHours(from.getHours() - 48);
+  // NewsAPI acepta fecha (día), así que filtramos por 24h exactas nosotros después
+  const from = new Date(); from.setDate(from.getDate() - 2); // pedir 2 días para no perder artículos al cambiar de día
   const params = new URLSearchParams({
     q: cfg.q,
     language: lang,
@@ -113,11 +116,22 @@ async function fetchNewsFor(cfg, lang) {
   return (data.articles||[]).map(a => ({...a, _lang: lang}));
 }
 
+// ---- Formateo y TRADUCCIÓN ----
 function formatToLines(text, min=5, max=10) {
   if (!text) return '';
-  const parts = (text.replace(/\n+/g,' ').split(/(?<=[\.!?])\s+/).filter(Boolean));
-  const sliced = parts.slice(0, Math.max(min, Math.min(max, parts.length)));
-  return sliced.join('\n');
+  const parts = (text.replace(/\n+/g,' ').split(/(?<=[\.!?])\s+/).filter(Boolean)).map(s=>s.trim());
+  let lines = parts.filter(Boolean);
+  if (lines.length > max) lines = lines.slice(0, max);
+  if (lines.length < min) {
+    // si hay menos de min, intenta trocear por comas para llegar al mínimo sin sobrepasar max
+    const extra = text.split(/[,;]\s+/).filter(Boolean);
+    for (const e of extra) {
+      if (lines.length >= min) break;
+      if (!lines.includes(e)) lines.push(e);
+    }
+    lines = lines.slice(0, Math.max(min, Math.min(max, lines.length)));
+  }
+  return lines.join('\n');
 }
 
 async function translateTitleToEs(a) {
@@ -146,6 +160,7 @@ module.exports = async (req, res) => {
   try {
     const topicRaw = (req.query?.topic || 'tecnología').toString();
 
+    // utilidades
     if (topicRaw === 'ping') return res.status(200).json({ ok: true, articles: [] });
     if (topicRaw === '__diag') {
       return res.status(200).json({
@@ -156,10 +171,15 @@ module.exports = async (req, res) => {
         env: process.env.VERCEL_ENV || 'unknown'
       });
     }
+    if (topicRaw === '__make_img') {
+      const title = (req.query?.title || '').toString().slice(0, 140) || 'Noticia';
+      const gen = await generateImageFor(title, 'Noticias');
+      return res.status(200).json({ url: gen.url || placeholderSVG(title), isAI: !!gen.url });
+    }
 
     const cfg = getTopicConfig(topicRaw);
 
-    // 1) Traer ES + EN de las últimas 48 horas
+    // 1) Traer ES + EN (hasta 2 días) y luego filtrar a 24h exactas
     let raw = [];
     try {
       const [es, en] = await Promise.all([
@@ -171,11 +191,11 @@ module.exports = async (req, res) => {
       return res.status(200).json({ articles: [], warning: `NewsAPI error: ${String(err)}` });
     }
 
-    // 2) Filtrar por tema + dentro de 48h exactas (SEPARADO ES/EN)
-    const within48h = (a) => hoursAgo(a.publishedAt) <= 48;
+    const within24h = (a) => hoursAgo(a.publishedAt) <= 24;
 
+    // 2) Filtrado por idioma + tema + 24h
     const filteredEs = raw.filter((a) => a._lang === 'es').filter((a) => {
-      if (!within48h(a)) return false;
+      if (!within24h(a)) return false;
       const text = `${a.title || ''} ${a.description || ''}`;
       const okInclude = cfg.include ? cfg.include.some((re) => re.test(text)) : true;
       const okExclude = cfg.exclude ? !cfg.exclude.some((re) => re.test(text)) : true;
@@ -183,14 +203,14 @@ module.exports = async (req, res) => {
     });
 
     const filteredEn = raw.filter((a) => a._lang === 'en').filter((a) => {
-      if (!within48h(a)) return false;
+      if (!within24h(a)) return false;
       const text = `${a.title || ''} ${a.description || ''}`;
       const okInclude = cfg.include ? cfg.include.some((re) => re.test(text)) : true;
       const okExclude = cfg.exclude ? !cfg.exclude.some((re) => re.test(text)) : true;
       return okInclude && okExclude;
     });
 
-    // 3) Ranking con cupos: máx 3 ES + 2 EN (rellena hasta 5)
+    // 3) Ranking + cupos (3 ES + 2 EN) + dedupe global
     const scoredEs = filteredEs.map(a => ({ a, score: relevanceScore(cfg, a) })).sort((x,y)=> y.score - x.score);
     const scoredEn = filteredEn.map(a => ({ a, score: relevanceScore(cfg, a) })).sort((x,y)=> y.score - x.score);
 
@@ -212,51 +232,47 @@ module.exports = async (req, res) => {
     takeFrom(scoredEs, cupoEs);
     takeFrom(scoredEn, cupoEn);
 
-    let combinedRemainder = [
+    let pool = [
       ...scoredEs.filter(x => !chosen.includes(x.a)),
       ...scoredEn.filter(x => !chosen.includes(x.a))
     ].sort((x,y)=> y.score - x.score);
 
-    while (chosen.length < 5 && combinedRemainder.length) {
-      const next = combinedRemainder.shift();
+    while (chosen.length < 5 && pool.length) {
+      const next = pool.shift();
       if (isDupVsChosen(next.a)) continue;
       chosen.push(next.a);
     }
 
     const top5 = chosen.slice(0,5);
 
+    // 4) Resumen (5–10 líneas) + imagen + TITULAR traducido
     async function summarize(a) {
       const en = a._lang === 'en';
       const basePrompt = en
-        ? `Traduce y resume al ESPAÑOL en 5 a 10 líneas. Cada línea debe ser una frase corta separada por salto de línea. Al final añade exactamente: "fuente original en inglés". No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`
-        : `Resume en ESPAÑOL en 5 a 10 líneas. Cada línea debe ser una frase corta separada por salto de línea. No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`;
+        ? `Traduce Y resume en ESPAÑOL en 5 a 10 líneas. Cada línea debe ser UNA frase breve separada por SALTO DE LÍNEA. No inventes datos. Al final añade exactamente: "fuente original en inglés".\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`
+        : `Resume en ESPAÑOL en 5 a 10 líneas. Cada línea debe ser UNA frase breve separada por SALTO DE LÍNEA. No inventes datos.\nTítulo: ${a.title}\nDescripción: ${a.description ?? '(sin descripción)'}\nEnlace: ${a.url}`;
       if (!process.env.OPENAI_API_KEY) {
-        const desc = a.description || a.content || '';
-        const base = formatToLines(desc || '', 5, 10);
+        const base = formatToLines(a.description || a.content || '', 5, 10);
         return en ? (base ? `${base}\n\nfuente original en inglés` : 'fuente original en inglés') : base;
       }
       try {
         const r = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Eres un asistente que traduce y resume noticias al español con precisión y neutralidad. Usa 5–10 líneas, cada una una frase.' }, { role: 'user', content: basePrompt } ], temperature: 0.2 })
+          body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Eres un asistente que traduce y resume noticias al español con precisión y neutralidad. Devuelve 5–10 LÍNEAS, cada línea una frase.' }, { role: 'user', content: basePrompt } ], temperature: 0.2 })
         });
         if (!r.ok) {
-          const desc = a.description || a.content || '';
-          const base = formatToLines(desc || '', 5, 10);
+          const base = formatToLines(a.description || a.content || '', 5, 10);
           return en ? (base ? `${base}\n\nfuente original en inglés` : 'fuente original en inglés') : base;
         }
         const j = await r.json();
-        const txt = j.choices?.[0]?.message?.content?.trim?.() || '';
-        return txt || formatToLines(a.description || '', 5, 10);
+        const txt = (j.choices?.[0]?.message?.content?.trim?.() || '');
+        return formatToLines(txt, 5, 10);
       } catch {
-        const desc = a.description || a.content || '';
-        const base = formatToLines(desc || '', 5, 10);
+        const base = formatToLines(a.description || a.content || '', 5, 10);
         return en ? (base ? `${base}\n\nfuente original en inglés` : 'fuente original en inglés') : base;
       }
     }
-
-    async function translateTitle(a) { return translateTitleToEs(a); }
 
     async function pickImage(a) {
       if (a.urlToImage) return { url: a.urlToImage, isAI: false };
@@ -268,13 +284,15 @@ module.exports = async (req, res) => {
     const articles = await Promise.all(
       top5.map(async (a, idx) => {
         const [titleEs, summary, img] = await Promise.all([
-          translateTitle(a),
+          translateTitleToEs(a),
           summarize(a),
           pickImage(a),
         ]);
+        const isEn = a._lang === 'en';
+        const titleOut = isEn ? `${titleEs || a.title} (ENG)` : (a.title || titleEs);
         return {
           id: `${a.source?.id ?? 'news'}-${idx}`,
-          title: titleEs || a.title,
+          title: titleOut,
           publishedAt: a.publishedAt,
           sourceName: a.source?.name ?? 'Desconocida',
           url: a.url,
